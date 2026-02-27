@@ -1,5 +1,6 @@
 const WebSocket = require('ws');
 const wss = new WebSocket.Server({ port: 8080 });
+const HEARTBEAT_INTERVAL = 30000;
 
 // Use a Map to store rooms. Key = sessionCode, Value = array of clients.
 const rooms = new Map();
@@ -43,10 +44,10 @@ wss.on('connection', (ws, req) => {
         const currentRoom = rooms.get(ws.sessionCode);
         if (!currentRoom) return;
 
-        // Relay the message to the *other* client in the same room
-        const otherClient = currentRoom[1 - ws.clientId];
-        if (otherClient && otherClient.readyState === WebSocket.OPEN) {
-            otherClient.send(message);
+        for (const client of currentRoom) {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+                client.send(message);
+            }
         }
     });
 
@@ -54,7 +55,6 @@ wss.on('connection', (ws, req) => {
         console.log(`Client ${ws.clientId} from session ${ws.sessionCode} disconnected.`);
         const currentRoom = rooms.get(ws.sessionCode);
         
-        // --- CORRECTED LOGIC ---
         if (currentRoom) {
             // Remove the disconnected client from the room array.
             const index = currentRoom.indexOf(ws);
@@ -75,3 +75,15 @@ wss.on('connection', (ws, req) => {
         }
     });
 });
+
+//Periodic cleanup
+setInterval(() => {
+    for (const [code, room] of rooms) {
+        const alive = room.filter(ws => ws.readyState === WebSocket.OPEN);
+        if (alive.length === 0) {
+            rooms.delete(code);
+        } else {
+            rooms.set(code, alive);
+        }
+    }
+}, HEARTBEAT_INTERVAL);
