@@ -1,11 +1,29 @@
 const WebSocket = require('ws');
-const wss = new WebSocket.Server({ port: 8080 });
+const http = require('http');
 const HEARTBEAT_INTERVAL = 30000;
+
+// Create an HTTP server so we can set TCP_NODELAY on every incoming socket
+// BEFORE the WebSocket upgrade. This is the server-side equivalent of the
+// setsockopt(TCP_NODELAY) call in the game client.
+const server = http.createServer();
+server.on('connection', (socket) => {
+    socket.setNoDelay(true);  // Disable Nagle's algorithm
+});
+
+const wss = new WebSocket.Server({
+    server,
+    // Disable per-message compression. Our packets are tiny binary frames
+    // (33 bytes for inputs). Compression adds latency (zlib has to flush)
+    // and CPU cost for zero size savings on data this small.
+    perMessageDeflate: false,
+});
 
 // Use a Map to store rooms. Key = sessionCode, Value = array of clients.
 const rooms = new Map();
 
-console.log("Session signaling server started on port 8080...");
+server.listen(8080, () => {
+    console.log("Session signaling server started on port 8080...");
+});
 
 wss.on('connection', (ws, req) => {
     // The client will connect to ws://your-server/SESSION_CODE
@@ -35,19 +53,24 @@ wss.on('connection', (ws, req) => {
     // Add the new client to the room
     const clientId = room.length;
     room.push(ws);
-    ws.clientId = clientId; // Attach an ID to the websocket object
+    ws.clientId = clientId;
     ws.sessionCode = sessionCode;
+
+    // Set up direct peer references for fastest possible relay.
+    // When the second player joins, both get a direct pointer to each other.
+    if (room.length === 2) {
+        room[0].peer = room[1];
+        room[1].peer = room[0];
+    }
 
     console.log(`Client ${clientId} joined session ${sessionCode}. Room size: ${room.length}`);
 
-    ws.on('message', message => {
-        const currentRoom = rooms.get(ws.sessionCode);
-        if (!currentRoom) return;
-
-        for (const client of currentRoom) {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
-                client.send(message);
-            }
+    // Hot path — relay binary data directly to peer with zero allocation.
+    // This runs 60 times per second per client during gameplay.
+    ws.on('message', (message) => {
+        const peer = ws.peer;
+        if (peer && peer.readyState === WebSocket.OPEN) {
+            peer.send(message);
         }
     });
 
@@ -62,13 +85,17 @@ wss.on('connection', (ws, req) => {
                 currentRoom.splice(index, 1);
             }
 
+            // Clear peer references
+            if (ws.peer) {
+                ws.peer.peer = null;
+                ws.peer = null;
+            }
+
             // If the room is now empty, delete it.
             if (currentRoom.length === 0) {
                 rooms.delete(ws.sessionCode);
                 console.log(`Session ${ws.sessionCode} was empty and has been cleared.`);
             } else {
-                // If the host is still there, re-assign clientId to the remaining player
-                // to ensure they are always clientId 0.
                 currentRoom[0].clientId = 0;
                 console.log(`Session ${ws.sessionCode} now has ${currentRoom.length} player(s).`);
             }
@@ -84,6 +111,12 @@ setInterval(() => {
             rooms.delete(code);
         } else {
             rooms.set(code, alive);
+            // Clear peer references for anyone whose peer was cleaned up
+            for (const ws of alive) {
+                if (ws.peer && ws.peer.readyState !== WebSocket.OPEN) {
+                    ws.peer = null;
+                }
+            }
         }
     }
 }, HEARTBEAT_INTERVAL);
