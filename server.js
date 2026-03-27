@@ -10,57 +10,71 @@ server.on('connection', (socket) => {
     socket.setNoDelay(true);  // Disable Nagle's algorithm
 });
 
+// Use noServer mode so we can validate session codes BEFORE completing
+// the WebSocket handshake. If we reject here, the client's on_open
+// never fires — it goes straight to on_error/on_close, which is what
+// lets the game show an error on the join screen instead of transitioning.
 const wss = new WebSocket.Server({
-    server,
-    // Disable per-message compression. Our packets are tiny binary frames
-    // (33 bytes for inputs). Compression adds latency (zlib has to flush)
-    // and CPU cost for zero size savings on data this small.
+    noServer: true,
     perMessageDeflate: false,
 });
 
 // Use a Map to store rooms. Key = sessionCode, Value = array of clients.
 const rooms = new Map();
 
-server.listen(8080, () => {
-    console.log("Session signaling server started on port 8080...");
-});
-
-wss.on('connection', (ws, req) => {
-    // Host connects to:   ws://server/SESSION_CODE?host
-    // Client connects to:  ws://server/SESSION_CODE
-    const [path, queryString] = req.url.split('?');
-    const sessionCode = path.substring(1); // Remove leading '/'
+// --- Validate and gate the upgrade BEFORE the WS handshake completes ---
+server.on('upgrade', (request, socket, head) => {
+    const [path, queryString] = request.url.split('?');
+    const sessionCode = path.substring(1);
     const isHost = (queryString === 'host');
 
     if (!sessionCode) {
-        console.log("Client connected without a session code. Closing.");
-        ws.close(1008, "Session code required");
+        console.log("Upgrade rejected: no session code.");
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        socket.destroy();
         return;
     }
 
-    console.log(`${isHost ? 'Host' : 'Client'} trying to ${isHost ? 'create' : 'join'} session: ${sessionCode}`);
-
     if (isHost) {
-        // Host creates (or reclaims) the room
+        // Host creates the room (or reclaims an empty one)
         if (!rooms.has(sessionCode)) {
             rooms.set(sessionCode, []);
         }
     } else {
-        // Client MUST join an existing room — reject if no host is waiting
+        // Client MUST join an existing room with a host waiting
         if (!rooms.has(sessionCode) || rooms.get(sessionCode).length === 0) {
-            console.log(`Session ${sessionCode} does not exist. Rejecting client.`);
-            ws.close(4001, "Session not found");
+            console.log(`Upgrade rejected: session ${sessionCode} does not exist.`);
+            socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+            socket.destroy();
             return;
         }
     }
-    const room = rooms.get(sessionCode);
 
-    // Don't allow more than 2 players
+    const room = rooms.get(sessionCode);
     if (room.length >= 2) {
-        console.log(`Session ${sessionCode} is full. Closing connection.`);
-        ws.close(1008, "Session is full");
+        console.log(`Upgrade rejected: session ${sessionCode} is full.`);
+        socket.write('HTTP/1.1 409 Conflict\r\n\r\n');
+        socket.destroy();
         return;
     }
+
+    // Validation passed — complete the WebSocket handshake
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+    });
+});
+
+server.listen(8080, () => {
+    console.log("Session signaling server started on port 8080...");
+});
+
+// --- Connection handler (only reached if upgrade was approved) ---
+wss.on('connection', (ws, req) => {
+    const [path, queryString] = req.url.split('?');
+    const sessionCode = path.substring(1);
+    const isHost = (queryString === 'host');
+
+    const room = rooms.get(sessionCode);
 
     // Add the new client to the room
     const clientId = room.length;
@@ -75,7 +89,7 @@ wss.on('connection', (ws, req) => {
         room[1].peer = room[0];
     }
 
-    console.log(`Client ${clientId} joined session ${sessionCode}. Room size: ${room.length}`);
+    console.log(`${isHost ? 'Host' : 'Client'} ${clientId} joined session ${sessionCode}. Room size: ${room.length}`);
 
     // Hot path — relay binary data directly to peer with zero allocation.
     // This runs 60 times per second per client during gameplay.
