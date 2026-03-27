@@ -26,8 +26,11 @@ server.listen(8080, () => {
 });
 
 wss.on('connection', (ws, req) => {
-    // The client will connect to ws://your-server/SESSION_CODE
-    const sessionCode = req.url.substring(1); // Get code from URL, remove leading '/'
+    // Host connects to:   ws://server/SESSION_CODE?host
+    // Client connects to:  ws://server/SESSION_CODE
+    const [path, queryString] = req.url.split('?');
+    const sessionCode = path.substring(1); // Remove leading '/'
+    const isHost = (queryString === 'host');
 
     if (!sessionCode) {
         console.log("Client connected without a session code. Closing.");
@@ -35,11 +38,20 @@ wss.on('connection', (ws, req) => {
         return;
     }
 
-    console.log(`Client trying to join session: ${sessionCode}`);
+    console.log(`${isHost ? 'Host' : 'Client'} trying to ${isHost ? 'create' : 'join'} session: ${sessionCode}`);
 
-    // Get or create the room for this session code
-    if (!rooms.has(sessionCode)) {
-        rooms.set(sessionCode, []);
+    if (isHost) {
+        // Host creates (or reclaims) the room
+        if (!rooms.has(sessionCode)) {
+            rooms.set(sessionCode, []);
+        }
+    } else {
+        // Client MUST join an existing room — reject if no host is waiting
+        if (!rooms.has(sessionCode) || rooms.get(sessionCode).length === 0) {
+            console.log(`Session ${sessionCode} does not exist. Rejecting client.`);
+            ws.close(4001, "Session not found");
+            return;
+        }
     }
     const room = rooms.get(sessionCode);
 
